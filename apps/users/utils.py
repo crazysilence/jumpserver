@@ -1,72 +1,30 @@
 # ~*~ coding: utf-8 ~*~
 #
-from __future__ import unicode_literals
-import os
-import re
-import pyotp
 import base64
 import logging
-import uuid
+import os
+import re
+import time
 
-import requests
-import ipaddress
-from django.http import Http404
+import pyotp
 from django.conf import settings
-from django.contrib.auth.mixins import UserPassesTestMixin
-from django.contrib.auth import authenticate
-from django.utils.translation import ugettext as _
 from django.core.cache import cache
 
 from common.tasks import send_mail_async
-from common.utils import reverse, get_object_or_none
-from common.models import Setting
-from common.forms import SecuritySettingForm
-from .models import User, LoginLog
+from common.utils import reverse, get_object_or_none, ip, safe_next_url
+from .models import User
 
-
-logger = logging.getLogger('jumpserver')
-
-
-class AdminUserRequiredMixin(UserPassesTestMixin):
-    def test_func(self):
-        if not self.request.user.is_authenticated:
-            return False
-        elif not self.request.user.is_superuser:
-            self.raise_exception = True
-            return False
-        return True
+logger = logging.getLogger('jumpserver.users')
 
 
 def send_user_created_mail(user):
-    subject = _('Create account successfully')
+    from .notifications import UserCreatedMsg
+
     recipient_list = [user.email]
-    message = _("""
-    Hello %(name)s:
-    </br>
-    Your account has been created successfully
-    </br>
-    Username: %(username)s
-    </br>
-    <a href="%(rest_password_url)s?token=%(rest_password_token)s">click here to set your password</a>
-    </br>
-    This link is valid for 1 hour. After it expires, <a href="%(forget_password_url)s?email=%(email)s">request new one</a>
+    msg = UserCreatedMsg(user).html_msg
+    subject = msg['subject']
+    message = msg['message']
 
-    </br>
-    ---
-
-    </br>
-    <a href="%(login_url)s">Login direct</a>
-
-    </br>
-    """) % {
-        'name': user.name,
-        'username': user.username,
-        'rest_password_url': reverse('users:reset-password', external=True),
-        'rest_password_token': user.generate_reset_token(),
-        'forget_password_url': reverse('users:forgot-password', external=True),
-        'email': user.email,
-        'login_url': reverse('users:login', external=True),
-    }
     if settings.DEBUG:
         try:
             print(message)
@@ -76,299 +34,268 @@ def send_user_created_mail(user):
     send_mail_async.delay(subject, message, recipient_list, html_message=message)
 
 
-def send_reset_password_mail(user):
-    subject = _('Reset password')
-    recipient_list = [user.email]
-    message = _("""
-    Hello %(name)s:
-    </br>
-    Please click the link below to reset your password, if not your request, concern your account security
-    </br>
-    <a href="%(rest_password_url)s?token=%(rest_password_token)s">Click here reset password</a>
-    </br>
-    This link is valid for 1 hour. After it expires, <a href="%(forget_password_url)s?email=%(email)s">request new one</a>
-
-    </br>
-    ---
-
-    </br>
-    <a href="%(login_url)s">Login direct</a>
-
-    </br>
-    """) % {
-        'name': user.name,
-        'rest_password_url': reverse('users:reset-password', external=True),
-        'rest_password_token': user.generate_reset_token(),
-        'forget_password_url': reverse('users:forgot-password', external=True),
-        'email': user.email,
-        'login_url': reverse('users:login', external=True),
-    }
-    if settings.DEBUG:
-        logger.debug(message)
-
-    send_mail_async.delay(subject, message, recipient_list, html_message=message)
-
-
-def send_reset_ssh_key_mail(user):
-    subject = _('SSH Key Reset')
-    recipient_list = [user.email]
-    message = _("""
-    Hello %(name)s:
-    </br>
-    Your ssh public key has been reset by site administrator.
-    Please login and reset your ssh public key.
-    </br>
-    <a href="%(login_url)s">Login direct</a>
-
-    </br>
-    """) % {
-        'name': user.name,
-        'login_url': reverse('users:login', external=True),
-    }
-    if settings.DEBUG:
-        logger.debug(message)
-
-    send_mail_async.delay(subject, message, recipient_list, html_message=message)
-
-
-def check_user_valid(**kwargs):
-    password = kwargs.pop('password', None)
-    public_key = kwargs.pop('public_key', None)
-    email = kwargs.pop('email', None)
-    username = kwargs.pop('username', None)
-
-    if username:
-        user = get_object_or_none(User, username=username)
-    elif email:
-        user = get_object_or_none(User, email=email)
-    else:
-        user = None
-
-    if user is None:
-        return None, _('User not exist')
-    elif not user.is_valid:
-        return None, _('Disabled or expired')
-
-    if password and authenticate(username=username, password=password):
-        return user, ''
-
-    if public_key and user.public_key:
-        public_key_saved = user.public_key.split()
-        if len(public_key_saved) == 1:
-            if public_key == public_key_saved[0]:
-                return user, ''
-        elif len(public_key_saved) > 1:
-            if public_key == public_key_saved[1]:
-                return user, ''
-    return None, _('Password or SSH public key invalid')
-
-
-def refresh_token(token, user, expiration=settings.TOKEN_EXPIRATION or 3600):
-    cache.set(token, user.id, expiration)
-
-
-def generate_token(request, user):
-    expiration = settings.TOKEN_EXPIRATION or 3600
-    remote_addr = request.META.get('REMOTE_ADDR', '')
-    if not isinstance(remote_addr, bytes):
-        remote_addr = remote_addr.encode("utf-8")
-    remote_addr = base64.b16encode(remote_addr)  # .replace(b'=', '')
-    token = cache.get('%s_%s' % (user.id, remote_addr))
-    if not token:
-        token = uuid.uuid4().hex
-        cache.set(token, user.id, expiration)
-        cache.set('%s_%s' % (user.id, remote_addr), token, expiration)
-    return token
-
-
-def validate_ip(ip):
-    try:
-        ipaddress.ip_address(ip)
-        return True
-    except ValueError:
-        pass
-    return False
-
-
-def get_login_ip(request):
-    x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR', '').split(',')
-    if x_forwarded_for and x_forwarded_for[0]:
-        login_ip = x_forwarded_for[0]
-    else:
-        login_ip = request.META.get('REMOTE_ADDR', '')
-
-    return login_ip
-
-
-def write_login_log(*args, **kwargs):
-    ip = kwargs.get('ip', '')
-    if not (ip and validate_ip(ip)):
-        ip = ip[:15]
-        city = "Unknown"
-    else:
-        city = get_ip_city(ip)
-    kwargs.update({'ip': ip, 'city': city})
-    LoginLog.objects.create(**kwargs)
-
-
-def get_ip_city(ip, timeout=10):
-    # Taobao ip api: http://ip.taobao.com/service/getIpInfo.php?ip=8.8.8.8
-    # Sina ip api: http://int.dpool.sina.com.cn/iplookup/iplookup.php?ip=8.8.8.8&format=json
-
-    url = 'http://ip.taobao.com/service/getIpInfo.php?ip=%s' % ip
-    try:
-        r = requests.get(url, timeout=timeout)
-    except:
-        r = None
-    city = 'Unknown'
-    if r and r.status_code == 200:
-        try:
-            data = r.json()
-            if not isinstance(data, int) and data['code'] == 0:
-                city = data['data']['country'] + ' ' + data['data']['city']
-        except ValueError:
-            pass
-    return city
-
-
-def get_user_or_tmp_user(request):
+def get_user_or_pre_auth_user(request):
     user = request.user
-    tmp_user = get_tmp_user_from_cache(request)
     if user.is_authenticated:
         return user
-    elif tmp_user:
-        return tmp_user
-    else:
-        raise Http404("Not found this user")
-
-
-def get_tmp_user_from_cache(request):
-    if not request.session.session_key:
-        return None
-    user = cache.get(request.session.session_key+'user')
+    pre_auth_user_id = request.session.get('user_id')
+    user = None
+    if pre_auth_user_id:
+        user = get_object_or_none(User, pk=pre_auth_user_id)
     return user
 
 
-def set_tmp_user_to_cache(request, user):
-    cache.set(request.session.session_key+'user', user, 600)
-
-
 def redirect_user_first_login_or_index(request, redirect_field_name):
-    if request.user.is_first_login:
-        return reverse('users:user-first-login')
-    return request.POST.get(
-        redirect_field_name,
-        request.GET.get(redirect_field_name, reverse('index')))
+    url = request.POST.get(redirect_field_name)
+    if not url:
+        url = request.GET.get(redirect_field_name)
+    url = safe_next_url(url, request=request)
+    # 防止 next 地址为 None
+    if not url or url.lower() in ['none']:
+        url = reverse('index')
+    return url
 
 
-def generate_otp_uri(request, issuer="Jumpserver"):
-    user = get_user_or_tmp_user(request)
-    otp_secret_key = cache.get(request.session.session_key+'otp_key', '')
-    if not otp_secret_key:
+def generate_otp_uri(username, otp_secret_key=None, issuer="JumpServer"):
+    if otp_secret_key is None:
         otp_secret_key = base64.b32encode(os.urandom(10)).decode('utf-8')
-    cache.set(request.session.session_key+'otp_key', otp_secret_key, 600)
     totp = pyotp.TOTP(otp_secret_key)
-    return totp.provisioning_uri(name=user.username, issuer_name=issuer)
+    otp_issuer_name = settings.OTP_ISSUER_NAME or issuer
+    uri = totp.provisioning_uri(name=username, issuer_name=otp_issuer_name)
+    return uri, otp_secret_key
 
 
 def check_otp_code(otp_secret_key, otp_code):
+    if not otp_secret_key or not otp_code:
+        return False
     totp = pyotp.TOTP(otp_secret_key)
-    return totp.verify(otp_code)
+    otp_valid_window = settings.OTP_VALID_WINDOW or 0
+    return totp.verify(otp=otp_code, valid_window=otp_valid_window)
 
 
-def get_password_check_rules():
+def get_password_check_rules(user):
     check_rules = []
-    min_length = settings.DEFAULT_PASSWORD_MIN_LENGTH
-    min_name = 'SECURITY_PASSWORD_MIN_LENGTH'
-    base_filed = SecuritySettingForm.base_fields
-    password_setting = Setting.objects.filter(name__startswith='SECURITY_PASSWORD')
-
-    if not password_setting:
-        # 用户还没有设置过密码校验规则
-        label = base_filed.get(min_name).label
-        label += ' ' + str(min_length) + _('Bit')
-        id = 'rule_' + min_name
-        rules = {'id': id, 'label': label}
-        check_rules.append(rules)
-
-    for setting in password_setting:
-        if setting.cleaned_value:
-            id = 'rule_' + setting.name
-            label = base_filed.get(setting.name).label
-            if setting.name == min_name:
-                label += str(setting.cleaned_value) + _('Bit')
-                min_length = setting.cleaned_value
-            rules = {'id': id, 'label': label}
-            check_rules.append(rules)
-
-    return check_rules, min_length
+    for rule in settings.SECURITY_PASSWORD_RULES:
+        key = "id_{}".format(rule.lower())
+        if user.is_org_admin and rule == 'SECURITY_PASSWORD_MIN_LENGTH':
+            rule = 'SECURITY_ADMIN_USER_PASSWORD_MIN_LENGTH'
+        value = getattr(settings, rule)
+        if not value:
+            continue
+        check_rules.append({'key': key, 'value': int(value)})
+    return check_rules
 
 
-def check_password_rules(password):
-    min_field_name = 'SECURITY_PASSWORD_MIN_LENGTH'
-    upper_field_name = 'SECURITY_PASSWORD_UPPER_CASE'
-    lower_field_name = 'SECURITY_PASSWORD_LOWER_CASE'
-    number_field_name = 'SECURITY_PASSWORD_NUMBER'
-    special_field_name = 'SECURITY_PASSWORD_SPECIAL_CHAR'
-    min_length_setting = Setting.objects.filter(name=min_field_name).first()
-    min_length = min_length_setting.value if min_length_setting else settings.DEFAULT_PASSWORD_MIN_LENGTH
-
-    password_setting = Setting.objects.filter(name__startswith='SECURITY_PASSWORD')
-    if not password_setting:
-        pattern = r"^.{" + str(min_length) + ",}$"
+def check_password_rules(password, is_org_admin=False):
+    pattern = r"^"
+    if settings.SECURITY_PASSWORD_UPPER_CASE:
+        pattern += '(?=.*[A-Z])'
+    if settings.SECURITY_PASSWORD_LOWER_CASE:
+        pattern += '(?=.*[a-z])'
+    if settings.SECURITY_PASSWORD_NUMBER:
+        pattern += '(?=.*\d)'
+    if settings.SECURITY_PASSWORD_SPECIAL_CHAR:
+        pattern += '(?=.*[`~!@#$%^&*()\-=_+\[\]{}|;:\'",.<>/?])'
+    pattern += '[a-zA-Z\d`~!@#\$%\^&\*\(\)-=_\+\[\]\{\}\|;:\'\",\.<>\/\?]'
+    if is_org_admin:
+        min_length = settings.SECURITY_ADMIN_USER_PASSWORD_MIN_LENGTH
     else:
-        pattern = r"^"
-        for setting in password_setting:
-            if setting.cleaned_value and setting.name == upper_field_name:
-                pattern += '(?=.*[A-Z])'
-            elif setting.cleaned_value and setting.name == lower_field_name:
-                pattern += '(?=.*[a-z])'
-            elif setting.cleaned_value and setting.name == number_field_name:
-                pattern += '(?=.*\d)'
-            elif setting.cleaned_value and setting.name == special_field_name:
-                pattern += '(?=.*[`~!@#\$%\^&\*\(\)-=_\+\[\]\{\}\|;:\'",\.<>\/\?])'
-        pattern += '[a-zA-Z\d`~!@#\$%\^&\*\(\)-=_\+\[\]\{\}\|;:\'",\.<>\/\?]'
-
+        min_length = settings.SECURITY_PASSWORD_MIN_LENGTH
+    pattern += '.{' + str(min_length - 1) + ',}$'
     match_obj = re.match(pattern, password)
     return bool(match_obj)
 
 
-def set_user_login_failed_count_to_cache(key_limit, key_block):
-    count = cache.get(key_limit)
-    count = count + 1 if count else 1
+class BlockUtil:
+    BLOCK_KEY_TMPL: str
 
-    setting_limit_time = Setting.objects.filter(
-        name='SECURITY_LOGIN_LIMIT_TIME'
-    ).first()
-    limit_time = setting_limit_time.cleaned_value if setting_limit_time \
-        else settings.DEFAULT_LOGIN_LIMIT_TIME
+    def __init__(self, username):
+        self.block_key = self.BLOCK_KEY_TMPL.format(username)
+        self.key_ttl = int(settings.SECURITY_LOGIN_LIMIT_TIME) * 60
 
-    setting_limit_count = Setting.objects.filter(
-        name='SECURITY_LOGIN_LIMIT_COUNT'
-    ).first()
-    limit_count = setting_limit_count.cleaned_value if setting_limit_count \
-        else settings.DEFAULT_LOGIN_LIMIT_COUNT
+    def block(self):
+        cache.set(self.block_key, True, self.key_ttl)
 
-    if count >= limit_count:
-        cache.set(key_block, 1, int(limit_time)*60)
-
-    cache.set(key_limit, count, int(limit_time)*60)
+    def is_block(self):
+        return bool(cache.get(self.block_key))
 
 
-def is_block_login(key_limit):
-    count = cache.get(key_limit)
+class BlockUtilBase:
+    LIMIT_KEY_TMPL: str
+    BLOCK_KEY_TMPL: str
 
-    setting_limit_count = Setting.objects.filter(
-        name='SECURITY_LOGIN_LIMIT_COUNT'
-    ).first()
-    limit_count = setting_limit_count.cleaned_value if setting_limit_count \
-        else settings.DEFAULT_LOGIN_LIMIT_COUNT
+    def __init__(self, username, ip):
+        self.username = username
+        self.ip = ip
+        self.limit_key = self.LIMIT_KEY_TMPL.format(username, ip)
+        self.block_key = self.BLOCK_KEY_TMPL.format(username)
+        self.key_ttl = int(settings.SECURITY_LOGIN_LIMIT_TIME) * 60
 
-    if count and count >= limit_count:
+    def get_remainder_times(self):
+        times_up = settings.SECURITY_LOGIN_LIMIT_COUNT
+        times_failed = self.get_failed_count()
+        times_remainder = int(times_up) - int(times_failed)
+        return times_remainder
+
+    def incr_failed_count(self) -> int:
+        limit_key = self.limit_key
+        count = cache.get(limit_key, 0)
+        count += 1
+        cache.set(limit_key, count, self.key_ttl)
+
+        limit_count = settings.SECURITY_LOGIN_LIMIT_COUNT
+        if count >= limit_count:
+            cache.set(self.block_key, True, self.key_ttl)
+        return limit_count - count
+
+    def get_failed_count(self):
+        count = cache.get(self.limit_key, 0)
+        return count
+
+    def clean_failed_count(self):
+        cache.delete(self.limit_key)
+        cache.delete(self.block_key)
+
+    @classmethod
+    def unblock_user(cls, username):
+        key_limit = cls.LIMIT_KEY_TMPL.format(username, '*')
+        key_block = cls.BLOCK_KEY_TMPL.format(username)
+        # Redis 尽量不要用通配
+        cache.delete_pattern(key_limit)
+        cache.delete(key_block)
+
+    @classmethod
+    def is_user_block(cls, username):
+        block_key = cls.BLOCK_KEY_TMPL.format(username)
+        return bool(cache.get(block_key))
+
+    def is_block(self):
+        return bool(cache.get(self.block_key))
+
+
+class BlockGlobalIpUtilBase:
+    LIMIT_KEY_TMPL: str
+    BLOCK_KEY_TMPL: str
+
+    def __init__(self, ip):
+        self.ip = ip
+        self.limit_key = self.LIMIT_KEY_TMPL.format(ip)
+        self.block_key = self.BLOCK_KEY_TMPL.format(ip)
+        self.key_ttl = int(settings.SECURITY_LOGIN_IP_LIMIT_TIME) * 60
+
+    @property
+    def ip_in_black_list(self):
+        return ip.contains_ip(self.ip, settings.SECURITY_LOGIN_IP_BLACK_LIST)
+
+    @property
+    def ip_in_white_list(self):
+        return ip.contains_ip(self.ip, settings.SECURITY_LOGIN_IP_WHITE_LIST)
+
+    def set_block_if_need(self):
+        if self.ip_in_white_list or self.ip_in_black_list:
+            return
+        count = cache.get(self.limit_key, 0)
+        count += 1
+        cache.set(self.limit_key, count, self.key_ttl)
+
+        limit_count = settings.SECURITY_LOGIN_IP_LIMIT_COUNT
+        if count < limit_count:
+            return
+        cache.set(self.block_key, True, self.key_ttl)
+
+    def clean_block_if_need(self):
+        cache.delete(self.limit_key)
+        cache.delete(self.block_key)
+
+    def is_block(self):
+        if self.ip_in_white_list:
+            return False
+        if self.ip_in_black_list:
+            return True
+        return bool(cache.get(self.block_key))
+
+
+class LoginBlockUtil(BlockUtilBase):
+    LIMIT_KEY_TMPL = "_LOGIN_LIMIT_{}_{}"
+    BLOCK_KEY_TMPL = "_LOGIN_BLOCK_{}"
+
+
+class MFABlockUtils(BlockUtilBase):
+    LIMIT_KEY_TMPL = "_MFA_LIMIT_{}_{}"
+    BLOCK_KEY_TMPL = "_MFA_BLOCK_{}"
+
+
+class LoginIpBlockUtil(BlockGlobalIpUtilBase):
+    LIMIT_KEY_TMPL = "_LOGIN_LIMIT_{}"
+    BLOCK_KEY_TMPL = "_LOGIN_BLOCK_IP_{}"
+
+
+def validate_emails(emails):
+    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    for e in emails:
+        e = e or ''
+        if re.match(pattern, e):
+            return e
+
+
+def construct_user_email(username, email, email_suffix=''):
+    default = f'{username}@{email_suffix or settings.EMAIL_SUFFIX}'
+    emails = [email, username]
+    email = validate_emails(emails)
+    return email or default
+
+
+def flatten_dict(d, parent_key='', sep='.'):
+    items = {}
+    for k, v in d.items():
+        new_key = f"{parent_key}{sep}{k}" if parent_key else k
+        if isinstance(v, dict):
+            items.update(flatten_dict(v, new_key, sep=sep))
+        elif isinstance(v, list):
+            for i, item in enumerate(v):
+                if isinstance(item, dict):
+                    items.update(flatten_dict(item, f"{new_key}[{i}]", sep=sep))
+                else:
+                    items[f"{new_key}[{i}]"] = item
+        else:
+            items[new_key] = v
+    return items
+
+
+def map_attributes(default_profile, profile, attributes):
+    detail = default_profile
+    for local_name, remote_name in attributes.items():
+        value = profile.get(remote_name)
+        if value:
+            detail[local_name] = value
+    return detail
+
+
+def get_current_org_members():
+    from orgs.utils import current_org
+    return current_org.get_members()
+
+
+def is_auth_time_valid(session, key):
+    return True if session.get(key, 0) > time.time() else False
+
+
+def is_auth_password_time_valid(session):
+    return is_auth_time_valid(session, 'auth_password_expired_at')
+
+
+def is_auth_otp_time_valid(session):
+    return is_auth_time_valid(session, 'auth_otp_expired_at')
+
+
+def is_confirm_time_valid(session, key):
+    if not settings.SECURITY_VIEW_AUTH_NEED_MFA:
         return True
+    mfa_verify_time = session.get(key, 0)
+    if time.time() - mfa_verify_time < settings.SECURITY_MFA_VERIFY_TTL:
+        return True
+    return False
 
 
-def is_need_unblock(key_block):
-    if not cache.get(key_block):
-        return False
-    return True
+def is_auth_confirm_time_valid(session):
+    return is_confirm_time_valid(session, 'MFA_VERIFY_TIME')

@@ -15,9 +15,11 @@ dump.rdb
 .tox
 .cache/
 .idea/
+.vscode/
+.fleet/
 db.sqlite3
 config.py
-migrations/
+config.yml
 *.log
 host_rsa_key
 *.bat
@@ -30,6 +32,16 @@ media
 celerybeat.pid
 django.db
 celerybeat-schedule.db
-data/static
 docs/_build/
 xpack
+xpack.bak
+### Vagrant ###
+.vagrant/
+release/*
+releashe
+/apps/script.py
+data/*
+test.py
+.history/
+.test/
+*.mo
